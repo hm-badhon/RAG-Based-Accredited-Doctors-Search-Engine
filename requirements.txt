@@ -1,0 +1,5 @@
+streamlit
+langchain
+chromadb
+langchain_google_genai
+dotenv
