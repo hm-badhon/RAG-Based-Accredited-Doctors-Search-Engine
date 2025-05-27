@@ -7,7 +7,10 @@ from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 import os
+import shutil
+import tempfile
 from datetime import datetime
+import stat
 
 # Try to import Chroma from langchain_chroma, fallback to langchain_community
 try:
@@ -48,10 +51,19 @@ with st.sidebar:
     k = st.slider("Number of search results", 1, 20, 10, help="Adjust how many documents are retrieved for each query.")
     temperature = st.slider("LLM Creativity", 0.0, 1.0, 0.0, help="Higher values make responses more creative, lower values more precise.")
     st.markdown("---")
-    st.info("Use the admin controls below to manage the PDF data source.")
+    st.info("Use the admin controls below to upload and manage the PDF data source.")
 
-# Initialize vector store with local LLM embeddings
-persist_dir = "chroma_db"
+# Initialize session state
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
+if "pdf_uploaded" not in st.session_state:
+    st.session_state.pdf_uploaded = False
+if "temp_pdf_path" not in st.session_state:
+    st.session_state.temp_pdf_path = None
+if "persist_dir" not in st.session_state:
+    st.session_state.persist_dir = "chroma_db"
+
+# Initialize embedding model
 embedding_model = "nomic-embed-text"
 try:
     embedding = OllamaEmbeddings(model=embedding_model)
@@ -63,38 +75,7 @@ except Exception as e:
     )
     st.stop()
 
-# Check if vector store exists; otherwise, process PDF
-if os.path.exists(persist_dir):
-    try:
-        vectorstore = Chroma(persist_directory=persist_dir, embedding_function=embedding)
-        st.success("✅ Loaded existing vector store from disk.")
-    except Exception as e:
-        st.error(f"❌ Failed to load vector store: {str(e)}. Try reprocessing the PDF.")
-        st.stop()
-else:
-    try:
-        pdf_path = "/media/nsl47/hdd/AI_project/BAHA/RAG-Based-Accredited-Doctors-Search-Engine/qa_file/doctors_list.pdf"
-        if not os.path.exists(pdf_path):
-            st.error(
-                f"❌ PDF file not found at {pdf_path}. "
-                "Please ensure the PDF exists in the 'qa_file' directory."
-            )
-            st.stop()
-        with st.spinner("📄 Processing PDF..."):
-            loader = PyPDFLoader(pdf_path)
-            data = loader.load()
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-            docs = text_splitter.split_documents(data)
-            vectorstore = Chroma.from_documents(documents=docs, embedding=embedding, persist_directory=persist_dir)
-        st.success("✅ Created and saved vector store from PDF.")
-    except Exception as e:
-        st.error(f"❌ Error processing PDF: {str(e)}")
-        st.stop()
-
-# Retriever
-retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": k})
-
-# Local LLM for question-answering
+# Initialize local LLM
 try:
     llm = OllamaLLM(model="llama3.2:1b", temperature=temperature)
     st.success("✅ Initialized LLM: llama3.2:1b")
@@ -113,11 +94,112 @@ system_prompt = (
     "don't know. Use three sentences maximum and keep the "
     "answer concise.\n\n{context}"
 )
-
 prompt = ChatPromptTemplate.from_messages([
     ("system", system_prompt),
     ("human", "{input}"),
 ])
+
+# Function to check and fix directory permissions
+def ensure_writable_directory(directory):
+    try:
+        if os.path.exists(directory):
+            # Check if directory is writable
+            if not os.access(directory, os.W_OK):
+                try:
+                    os.chmod(directory, stat.S_IRWXU)
+                    st.info(f"✅ Adjusted permissions for {directory} to make it writable.")
+                except PermissionError:
+                    return False
+            return True
+        else:
+            # Create directory with writable permissions
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            return True
+    except Exception as e:
+        st.error(f"❌ Failed to ensure writable directory '{directory}': {str(e)}")
+        return False
+
+# Admin controls for PDF upload
+with st.sidebar.expander("🛠️ Admin Controls"):
+    uploaded_file = st.file_uploader("Upload Doctors List PDF", type="pdf", help="Upload a PDF containing the doctors list (max 200MB).")
+    if uploaded_file:
+        try:
+            if uploaded_file.size > 200 * 1024 * 1024:
+                st.error("❌ Uploaded file exceeds 200MB limit.")
+                st.stop()
+            st.session_state.temp_pdf_path = "temp_doctors_list.pdf"
+            with open(st.session_state.temp_pdf_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            st.session_state.pdf_uploaded = True
+            st.success("✅ PDF uploaded successfully.")
+        except Exception as e:
+            st.error(f"❌ Error uploading PDF: {str(e)}")
+            st.stop()
+
+    if st.button("Process PDF", help="Build or rebuild the vector store with the uploaded PDF"):
+        if not st.session_state.pdf_uploaded or not st.session_state.temp_pdf_path:
+            st.error("❌ No PDF uploaded. Please upload a PDF file first.")
+        else:
+            # Check if default persist_dir is writable
+            persist_dir = st.session_state.persist_dir
+            if not ensure_writable_directory(persist_dir):
+                # Fallback to temporary directory
+                persist_dir = os.path.join(tempfile.gettempdir(), "chroma_db_temp")
+                st.session_state.persist_dir = persist_dir
+                st.warning(
+                    f"⚠️ Default directory 'chroma_db' is not writable. Using temporary directory '{persist_dir}' instead. "
+                    "To fix, ensure the 'chroma_db' directory has write permissions (e.g., 'chmod -R u+rw chroma_db' on Linux/macOS)."
+                )
+                if not ensure_writable_directory(persist_dir):
+                    st.error("❌ Cannot create a writable temporary directory. Please check your system permissions.")
+                    st.stop()
+
+            with st.spinner("📄 Processing PDF..."):
+                try:
+                    if os.path.exists(persist_dir):
+                        shutil.rmtree(persist_dir)
+                    loader = PyPDFLoader(st.session_state.temp_pdf_path)
+                    data = loader.load()
+                    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+                    docs = text_splitter.split_documents(data)
+                    st.session_state.vectorstore = Chroma.from_documents(
+                        documents=docs, embedding=embedding, persist_directory=persist_dir
+                    )
+                    st.success("✅ PDF processed and vector store created.")
+                except Exception as e:
+                    if "attempt to write a readonly database" in str(e).lower():
+                        st.error(
+                            f"❌ Error processing PDF: Cannot write to database in '{persist_dir}'. "
+                            "Please ensure the directory has write permissions (e.g., 'chmod -R u+rw chroma_db' on Linux/macOS) "
+                            "or try running the app in a different directory with full write access."
+                        )
+                    else:
+                        st.error(f"❌ Error processing PDF: {str(e)}")
+                    st.stop()
+
+# Check if vector store is available
+if st.session_state.vectorstore is None:
+    persist_dir = st.session_state.persist_dir
+    if os.path.exists(persist_dir):
+        try:
+            st.session_state.vectorstore = Chroma(persist_directory=persist_dir, embedding_function=embedding)
+            st.success("✅ Loaded existing vector store from disk.")
+        except Exception as e:
+            if "attempt to write a readonly database" in str(e).lower():
+                st.error(
+                    f"❌ Failed to load vector store: Cannot write to database in '{persist_dir}'. "
+                    "Please ensure the directory has write permissions (e.g., 'chmod -R u+rw chroma_db' on Linux/macOS) "
+                    "or try running the app in a different directory with full write access."
+                )
+            else:
+                st.error(f"❌ Failed to load vector store: {str(e)}. Please upload and process a PDF.")
+            st.stop()
+    else:
+        st.warning("⚠️ No vector store available. Please upload and process a PDF using the admin controls.")
+        st.stop()
+
+# Retriever
+retriever = st.session_state.vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": k})
 
 # Chat input section
 with st.container():
@@ -145,7 +227,6 @@ with st.container():
     if st.session_state.latest_query and st.session_state.latest_response:
         with st.container():
             st.markdown('<div class="chat-container">', unsafe_allow_html=True)
-            # User message
             st.markdown(
                 f"""
                 <div class="user-message">
@@ -155,7 +236,6 @@ with st.container():
                 """,
                 unsafe_allow_html=True
             )
-            # Assistant message
             st.markdown(
                 f"""
                 <div class="assistant-message">
@@ -168,32 +248,3 @@ with st.container():
             st.markdown('</div>', unsafe_allow_html=True)
     else:
         st.info("Start chatting above to find doctors or specialties!")
-
-# Admin controls
-with st.sidebar.expander("🛠️ Admin Controls"):
-    uploaded_file = st.file_uploader("Upload New PDF (Optional)", type="pdf", help="Upload a new doctors list PDF (max 200MB).")
-    if uploaded_file:
-        try:
-            if uploaded_file.size > 200 * 1024 * 1024:
-                st.error("❌ Uploaded file exceeds 200MB limit.")
-                st.stop()
-            with open("temp_doctors_list.pdf", "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            pdf_path = "temp_doctors_list.pdf"
-            st.success("✅ PDF uploaded successfully.")
-        except Exception as e:
-            st.error(f"❌ Error uploading PDF: {str(e)}")
-    if st.button("Reprocess PDF", help="Rebuild the vector store with the current PDF"):
-        with st.spinner("📄 Reprocessing PDF..."):
-            try:
-                if os.path.exists(persist_dir):
-                    import shutil
-                    shutil.rmtree(persist_dir)
-                loader = PyPDFLoader(pdf_path)
-                data = loader.load()
-                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-                docs = text_splitter.split_documents(data)
-                vectorstore = Chroma.from_documents(documents=docs, embedding=embedding, persist_directory=persist_dir)
-                st.success("✅ PDF reprocessed and vector store updated.")
-            except Exception as e:
-                st.error(f"❌ Error reprocessing PDF: {str(e)}")
